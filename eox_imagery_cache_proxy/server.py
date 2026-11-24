@@ -36,14 +36,21 @@ alpha.73 / combined-73, commit 88b13c33954550c6ac660dceb743a4288a9aafac,
   background expiry. Failures, errors, and truncated reads are already
   excluded from the cache entirely (never written in the first place), so
   there is nothing time-based to expire there either.
-- A dedicated upstream health-check endpoint (``/__health``) is exposed per
-  the cross-lane direction: TTL 0, always a live round trip, bypassing the
-  tile cache entirely (never read from or written to it), counted
-  separately (``probe_sends``) so it never inflates or deflates the
-  ordinary cold/warm tile counters. It issues a bounded ``Range:
+- A dedicated upstream health-check endpoint (``GET``/``HEAD /__health``)
+  is exposed per the cross-lane direction (MINECRAFT-571 comments
+  55734/55737/55789/55808/55816): TTL 0, always a live round trip,
+  bypassing the tile cache entirely (never read from or written to it),
+  counted separately (``probe_sends``) so it never inflates or deflates
+  the ordinary cold/warm tile counters. It issues a bounded ``Range:
   bytes=0-0`` read of a fixed representative tile (``0/0/0.jpg``, always
-  present at the minimum zoom) against the real upstream — not the
-  game's own request path, which never calls this endpoint itself.
+  present at the minimum zoom) against the real upstream, treating either
+  ``200`` or ``206`` from THAT read as healthy (both are genuine
+  successful answers to a Range request). The real client
+  (``EarthStatus.reach()``) probes with a plain, no-Range ``HEAD`` against
+  THIS endpoint and requires exactly this proxy's own ``200`` to count as
+  healthy — ``HEAD`` therefore answers with just that status and no body;
+  ``GET`` answers the same status with a JSON body. The game never calls
+  ``GET /__health`` itself.
 """
 
 from __future__ import annotations
@@ -215,6 +222,34 @@ def make_handler(cache: Cache, config: Config):
         def log_message(self, fmt, *args):  # noqa: D401 - silence default stderr logging
             pass
 
+        def _check_health(self) -> tuple[int, dict]:
+            # TTL 0, always live: never read from or written to the tile
+            # cache, and counted separately from ordinary tile cold/warm
+            # reads. Health here means exactly the health of the fixed
+            # upstream for the probe request actually sent (a bounded Range
+            # read) — 200 or 206 are both genuine successful answers to
+            # that request; anything else (404/403/5xx/no response) is not.
+            status, _body, _complete = _forward(config, _HEALTH_PROBE_PATH, _HEALTH_PROBE_RANGE)
+            cache.record_probe_send()
+            if status == 0:
+                return 502, {"upstream": "unreachable"}
+            if status in (200, 206):
+                return 200, {"upstream": "reachable", "status": status}
+            return 502, {"upstream": "unhealthy", "status": status}
+
+        def do_HEAD(self) -> None:
+            # The real client (EarthStatus.reach()) probes the dedicated
+            # health endpoint with HEAD, expecting exactly this proxy's own
+            # HTTP status (200 healthy, anything else not) and no body.
+            parsed = urlsplit(self.path)
+            if parsed.path == "/__health":
+                status, _body = self._check_health()
+                self.send_response(status)
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+
         def do_GET(self) -> None:
             parsed = urlsplit(self.path)
 
@@ -223,18 +258,8 @@ def make_handler(cache: Cache, config: Config):
                 return
 
             if parsed.path == "/__health":
-                # TTL 0, always live: never read from or written to the
-                # tile cache, and counted separately from ordinary tile
-                # cold/warm reads.
-                status, _body, _complete = _forward(config, _HEALTH_PROBE_PATH, _HEALTH_PROBE_RANGE)
-                cache.record_probe_send()
-                if status == 0:
-                    self._respond_json(502, {"upstream": "unreachable"})
-                    return
-                if status in (200, 206):
-                    self._respond_json(200, {"upstream": "reachable", "status": status})
-                    return
-                self._respond_json(502, {"upstream": "unhealthy", "status": status})
+                status, body = self._check_health()
+                self._respond_json(status, body)
                 return
 
             if _validate_tile_path(parsed.path) is None:

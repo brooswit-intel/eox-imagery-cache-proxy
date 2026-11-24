@@ -56,16 +56,23 @@ EOX WMTS capabilities document:
   is a genuine `2xx` body and is cached like any other successful tile; the
   client, not this proxy, decides that a non-JPEG body means "no imagery."
   This proxy forwards status and body through unmodified.
-- A dedicated upstream health-check endpoint, `GET /__health`, per the
-  cross-lane direction (MINECRAFT-571 comments 55734/55737): TTL 0, always
-  a live round trip, **never** read from or written to the tile cache,
-  counted separately (`probe_sends`) so it never inflates or deflates the
-  ordinary tile `cold_misses`/`warm_hits`. It issues a bounded
-  `Range: bytes=0-0` read of a fixed representative tile (`0/0/0.jpg`,
-  always present at the minimum zoom) against the real upstream. The game
-  itself never calls this endpoint directly; it is wiring for whatever
-  configured health-monitoring the integration lane (MINECRAFT-580) points
-  at it.
+- A dedicated upstream health-check endpoint, `GET`/`HEAD /__health`, per
+  the cross-lane direction (MINECRAFT-571 comments 55734/55737/55789/
+  55808/55816): TTL 0, always a live round trip, **never** read from or
+  written to the tile cache, counted separately (`probe_sends`) so it
+  never inflates or deflates the ordinary tile `cold_misses`/`warm_hits`.
+  It issues a bounded `Range: bytes=0-0` read of a fixed representative
+  tile (`0/0/0.jpg`, always present at the minimum zoom) against the real
+  upstream, treating either `200` or `206` as healthy (both are genuine
+  successful answers to that exact Range request — unlike the plain,
+  no-Range `HEAD` the real client sends to this endpoint itself, where
+  only its own `200` counts). `HEAD /__health` answers with just this
+  proxy's own status and no body, matching the real client
+  (`EarthStatus.reach()`), which probes with `HEAD` and requires exactly
+  `200`; `GET /__health` answers the same status with a JSON body for
+  humans/tooling. The game itself never calls `GET /__health`; only
+  `HEAD /__health` is on the real client's path, via whatever configured
+  health-monitoring the integration lane (MINECRAFT-580) points at it.
 
 ## Running it
 
@@ -186,7 +193,9 @@ access, no live provider) and exercise:
   counted separately from ordinary tile reads),
 - health-endpoint-failure-vs-warm-tile (a down upstream fails `/__health` live
   through the proxy while an already-warmed tile keeps serving from SQLite
-  unaffected, then `/__health` recovers once the upstream comes back).
+  unaffected, then `/__health` recovers once the upstream comes back),
+- health-endpoint-head (`HEAD /__health` answers with just this proxy's
+  own status and no body, matching the real client's probe shape).
 - ttl-minus-one (a warm tile survives both a restart and a simulated huge
   forward clock jump with zero additional upstream calls),
 - explicit-invalidation (`DELETE` on one tile path, and `DELETE

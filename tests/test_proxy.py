@@ -56,6 +56,15 @@ def _health(port: int) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read())
 
 
+def _health_head(port: int) -> int:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/__health", method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
 class ProxyTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -287,6 +296,21 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(status2, 206)
         self.assertEqual(body2, self.tile_bytes)
         self.assertEqual(self.upstream.call_count, calls_before + 1)
+
+    def test_health_endpoint_also_answers_head_with_status_only(self) -> None:
+        # The real client (EarthStatus.reach()) probes with HEAD, expecting
+        # exactly this proxy's own status and no body.
+        server = self._start_server()
+        port = server.server_address[1]
+
+        status = _health_head(port)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.upstream.call_count, 1)
+        self.assertEqual(_stats(port)["probe_sends"], 1)
+
+        self.upstream.down = True
+        status2 = _health_head(port)
+        self.assertEqual(status2, 502)
 
     def test_clear_all_invalidates_every_entry(self) -> None:
         server = self._start_server()
