@@ -35,6 +35,17 @@ def _stats(port: int) -> dict:
         return json.loads(resp.read())
 
 
+def _delete(port: int, path: str) -> tuple[int, dict]:
+    import json
+
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
 def _health(port: int) -> tuple[int, dict]:
     import json
 
@@ -224,6 +235,70 @@ class ProxyTestCase(unittest.TestCase):
         health_status2, health_body2 = _health(port)
         self.assertEqual(health_status2, 200)
         self.assertEqual(health_body2["upstream"], "reachable")
+
+
+    def test_good_hit_survives_restart_and_large_clock_advance(self) -> None:
+        import time as time_mod
+
+        server = self._start_server()
+        port = server.server_address[1]
+        status, body = _get(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.tile_bytes)
+        calls_after_warm = self.upstream.call_count
+
+        # TTL -1: no time-based expiration. A huge forward clock jump must
+        # not invalidate the entry.
+        real_time = time_mod.time
+        time_mod.time = lambda: real_time() + 10_000_000
+        try:
+            status2, body2 = _get(port, TILE_5_3_2, TILE_RANGE)
+        finally:
+            time_mod.time = real_time
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.tile_bytes)
+        self.assertEqual(self.upstream.call_count, calls_after_warm)
+
+        # And a restart (fresh Cache/ProxyServer against the same file).
+        server.shutdown()
+        server.server_close()
+        second = self._start_server()
+        port2 = second.server_address[1]
+        status3, body3 = _get(port2, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status3, 206)
+        self.assertEqual(body3, self.tile_bytes)
+        self.assertEqual(self.upstream.call_count, calls_after_warm)
+
+    def test_explicit_invalidation_forces_a_fresh_upstream_read(self) -> None:
+        server = self._start_server()
+        port = server.server_address[1]
+        _get(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(_stats(port)["cached_entries"], 1)
+
+        status, body = _delete(port, TILE_5_3_2)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["invalidated"], 1)
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
+        # No TTL, no eviction triggered it — only the explicit DELETE did.
+        # The next identical read is a genuine cold miss again.
+        calls_before = self.upstream.call_count
+        status2, body2 = _get(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.tile_bytes)
+        self.assertEqual(self.upstream.call_count, calls_before + 1)
+
+    def test_clear_all_invalidates_every_entry(self) -> None:
+        server = self._start_server()
+        port = server.server_address[1]
+        _get(port, TILE_5_3_2, TILE_RANGE)
+        _get(port, TILE_0_0_0, TILE_RANGE)
+        self.assertEqual(_stats(port)["cached_entries"], 2)
+
+        status, body = _delete(port, "/_internal/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["invalidated"], 2)
+        self.assertEqual(_stats(port)["cached_entries"], 0)
 
 
 if __name__ == "__main__":

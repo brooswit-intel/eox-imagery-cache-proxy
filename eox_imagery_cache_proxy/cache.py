@@ -95,6 +95,31 @@ class Cache:
             self._evict_locked()
             self._conn.commit()
 
+    def delete_prefix(self, path_prefix: str) -> int:
+        """Explicitly invalidates every cached entry whose key starts with
+        ``path_prefix`` (a tile path, e.g. ``/5/3/2.jpg``). Returns the
+        number of entries removed. Data has no time-based expiration
+        (TTL -1), so this is the only way a stale entry ever leaves the
+        cache short of eviction.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key FROM entries WHERE key LIKE ? ESCAPE '\\'",
+                (path_prefix.replace("%", "\\%").replace("_", "\\_") + "%",),
+            ).fetchall()
+            for (key,) in rows:
+                self._conn.execute("DELETE FROM entries WHERE key = ?", (key,))
+            self._conn.commit()
+        return len(rows)
+
+    def clear(self) -> int:
+        """Explicitly invalidates every cached entry. Returns the number removed."""
+        with self._lock:
+            count = self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            self._conn.execute("DELETE FROM entries")
+            self._conn.commit()
+        return count
+
     def _evict_locked(self) -> None:
         total = self._conn.execute("SELECT COALESCE(SUM(size), 0) FROM entries").fetchone()[0]
         if total <= self._max_bytes:

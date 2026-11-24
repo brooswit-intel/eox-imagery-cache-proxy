@@ -27,6 +27,15 @@ alpha.73 / combined-73, commit 88b13c33954550c6ac660dceb743a4288a9aafac,
   placeholder image for open-sea tiles, which is a genuine 2xx body and is
   cached like any other successful tile. This proxy forwards status and
   body through unmodified and lets the client keep making that distinction.
+- Cached tile data has TTL -1 (no time-based expiration) per the
+  cross-lane cache-lifetime direction (MINECRAFT-571 comment 55740): a
+  good tile survives a restart and an arbitrary clock advance with zero
+  further upstream calls. This is bounded by the byte-cap eviction below,
+  not by time, and remains explicitly invalidatable (``DELETE <tile
+  path>``, removing every cached range for that path) — never by a
+  background expiry. Failures, errors, and truncated reads are already
+  excluded from the cache entirely (never written in the first place), so
+  there is nothing time-based to expire there either.
 - A dedicated upstream health-check endpoint (``/healthz``) is exposed per
   the cross-lane direction: TTL 0, always a live round trip, bypassing the
   tile cache entirely (never read from or written to it), counted
@@ -256,6 +265,18 @@ def make_handler(cache: Cache, config: Config):
                 self._respond_plain(502, b"upstream unreachable")
                 return
             self._respond_bytes(status, body)
+
+        def do_DELETE(self) -> None:
+            parsed = urlsplit(self.path)
+            if parsed.path == "/_internal/cache":
+                removed = cache.clear()
+                self._respond_json(200, {"invalidated": removed})
+                return
+            if _validate_tile_path(parsed.path) is None:
+                self._respond_plain(404, b"not a valid EOX tile path")
+                return
+            removed = cache.delete_prefix(parsed.path)
+            self._respond_json(200, {"invalidated": removed})
 
         def _respond_bytes(self, status: int, body: bytes) -> None:
             self.send_response(status)

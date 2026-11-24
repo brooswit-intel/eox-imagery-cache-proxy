@@ -95,6 +95,14 @@ Config is via environment variables, all optional:
   `Content-Length` the delivered body didn't match) are never cached and
   remain retryable on the next request.
 - Cache key is the exact `(tile path, byte range)` the client asked for.
+- Cached tile data is **TTL -1** (no time-based expiration) per the
+  cross-lane direction (MINECRAFT-571 comment 55740): a good hit survives
+  a restart and an arbitrary clock advance with zero further upstream
+  calls. It is still bounded by the byte cap below, and explicitly
+  invalidatable:
+  - `DELETE <zoom>/<row>/<col>.jpg` removes every cached range for that
+    one tile.
+  - `DELETE /_internal/cache` clears the entire cache.
 - `/healthz` is carved out of ordinary caching entirely (see above) — TTL
   0, always live.
 - Concurrent identical-tile misses are deduplicated (single-flight): N
@@ -179,3 +187,8 @@ access, no live provider) and exercise:
 - healthz-failure-vs-warm-tile (a down upstream fails `/healthz` live
   through the proxy while an already-warmed tile keeps serving from SQLite
   unaffected, then `/healthz` recovers once the upstream comes back).
+- ttl-minus-one (a warm tile survives both a restart and a simulated huge
+  forward clock jump with zero additional upstream calls),
+- explicit-invalidation (`DELETE` on one tile path, and `DELETE
+  /_internal/cache` for everything, each force the next read to go
+  upstream again).
