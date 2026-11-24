@@ -213,24 +213,33 @@ def _forward(config: Config, path: str, range_header: str, max_body_bytes: int =
 
 def make_handler(cache: Cache, config: Config):
     locks_guard = threading.Lock()
-    inflight: dict[str, threading.Lock] = {}
+    # Each entry is [lock, waiter_count]. Unlike CHELSA's fixed five-path
+    # key space, EOX's distinct tile keys are effectively unbounded over a
+    # long-running process (every zoom/row/col ever requested), so the
+    # per-key lock must be reclaimed once nobody is waiting on it — left
+    # in place forever, this dict would grow without limit.
+    inflight: dict[str, list] = {}
 
     def singleflight_fetch(key: str, path: str, range_header: str):
         with locks_guard:
-            lock = inflight.setdefault(key, threading.Lock())
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                return "warm", cached.status, cached.body
-            status, body, complete = _forward(config, path, range_header)
-            if status in (200, 206) and complete:
-                cache.put(key, CachedRange(status=status, body=body))
-                return "cold", status, body
-            return "uncached", status, body
-        # Lock is released; stale per-path lock objects are intentionally
-        # left in the dict (bounded by distinct tile keys actually
-        # requested, not by request volume) rather than torn down under a
-        # race.
+            entry = inflight.setdefault(key, [threading.Lock(), 0])
+            entry[1] += 1
+            lock = entry[0]
+        try:
+            with lock:
+                cached = cache.get(key)
+                if cached is not None:
+                    return "warm", cached.status, cached.body
+                status, body, complete = _forward(config, path, range_header)
+                if status in (200, 206) and complete:
+                    cache.put(key, CachedRange(status=status, body=body))
+                    return "cold", status, body
+                return "uncached", status, body
+        finally:
+            with locks_guard:
+                entry[1] -= 1
+                if entry[1] == 0 and inflight.get(key) is entry:
+                    del inflight[key]
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "eox-imagery-cache-proxy/0.1"

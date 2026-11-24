@@ -119,7 +119,11 @@ Config is via environment variables, all optional:
   0, always live.
 - Concurrent identical-tile misses are deduplicated (single-flight): N
   simultaneous requests for the same uncached tile produce exactly one
-  upstream send, and every waiter gets that one result.
+  upstream send, and every waiter gets that one result. Per-tile locks are
+  reference-counted and reclaimed once nobody is waiting on them — EOX's
+  tile key space is effectively unbounded over a long-running process
+  (every zoom/row/col ever requested), unlike a fixed small path set, so
+  the lock map does not grow without limit.
 - The cache is bounded (`PROXY_MAX_CACHE_BYTES`); exceeding it evicts the
   least-recently-accessed entries, not a blanket flush.
 
