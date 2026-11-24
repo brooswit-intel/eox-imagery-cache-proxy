@@ -36,7 +36,7 @@ alpha.73 / combined-73, commit 88b13c33954550c6ac660dceb743a4288a9aafac,
   background expiry. Failures, errors, and truncated reads are already
   excluded from the cache entirely (never written in the first place), so
   there is nothing time-based to expire there either.
-- A dedicated upstream health-check endpoint (``/healthz``) is exposed per
+- A dedicated upstream health-check endpoint (``/__health``) is exposed per
   the cross-lane direction: TTL 0, always a live round trip, bypassing the
   tile cache entirely (never read from or written to it), counted
   separately (``probe_sends``) so it never inflates or deflates the
@@ -222,7 +222,7 @@ def make_handler(cache: Cache, config: Config):
                 self._respond_json(200, cache.stats() | {"attribution": ATTRIBUTION})
                 return
 
-            if parsed.path == "/healthz":
+            if parsed.path == "/__health":
                 # TTL 0, always live: never read from or written to the
                 # tile cache, and counted separately from ordinary tile
                 # cold/warm reads.

@@ -56,7 +56,7 @@ EOX WMTS capabilities document:
   is a genuine `2xx` body and is cached like any other successful tile; the
   client, not this proxy, decides that a non-JPEG body means "no imagery."
   This proxy forwards status and body through unmodified.
-- A dedicated upstream health-check endpoint, `GET /healthz`, per the
+- A dedicated upstream health-check endpoint, `GET /__health`, per the
   cross-lane direction (MINECRAFT-571 comments 55734/55737): TTL 0, always
   a live round trip, **never** read from or written to the tile cache,
   counted separately (`probe_sends`) so it never inflates or deflates the
@@ -103,7 +103,7 @@ Config is via environment variables, all optional:
   - `DELETE <zoom>/<row>/<col>.jpg` removes every cached range for that
     one tile.
   - `DELETE /_internal/cache` clears the entire cache.
-- `/healthz` is carved out of ordinary caching entirely (see above) — TTL
+- `/__health` is carved out of ordinary caching entirely (see above) — TTL
   0, always live.
 - Concurrent identical-tile misses are deduplicated (single-flight): N
   simultaneous requests for the same uncached tile produce exactly one
@@ -126,7 +126,7 @@ survive a process restart, unlike pure in-memory counters):
 - `cold_misses` — a tile read that went out over the network (success,
   error, or truncated — every attempted tile send is counted here exactly
   once, regardless of outcome).
-- `probe_sends` — a `/healthz` reachability probe, counted separately so it
+- `probe_sends` — a `/__health` reachability probe, counted separately so it
   never inflates or deflates the tile counters above.
 
 `attribution` echoes `ImagerySource.ATTRIBUTION` verbatim so a consumer
@@ -182,11 +182,11 @@ access, no live provider) and exercise:
   row/col/zoom, is rejected with `404` before any upstream send),
 - concurrent-miss-dedup (eight simultaneous identical-tile misses collapse
   into exactly one upstream send),
-- healthz-live (`/healthz` always goes live, is never cached, and is
+- health-endpoint-live (`/__health` always goes live, is never cached, and is
   counted separately from ordinary tile reads),
-- healthz-failure-vs-warm-tile (a down upstream fails `/healthz` live
+- health-endpoint-failure-vs-warm-tile (a down upstream fails `/__health` live
   through the proxy while an already-warmed tile keeps serving from SQLite
-  unaffected, then `/healthz` recovers once the upstream comes back).
+  unaffected, then `/__health` recovers once the upstream comes back).
 - ttl-minus-one (a warm tile survives both a restart and a simulated huge
   forward clock jump with zero additional upstream calls),
 - explicit-invalidation (`DELETE` on one tile path, and `DELETE

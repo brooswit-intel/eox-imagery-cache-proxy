@@ -50,7 +50,7 @@ def _health(port: int) -> tuple[int, dict]:
     import json
 
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as resp:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/__health", timeout=5) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
@@ -186,7 +186,7 @@ class ProxyTestCase(unittest.TestCase):
         # Eight concurrent identical misses collapse into one upstream send.
         self.assertEqual(self.upstream.call_count, 1)
 
-    def test_healthz_is_live_and_never_touches_the_tile_cache(self) -> None:
+    def test_health_endpoint_is_live_and_never_touches_the_tile_cache(self) -> None:
         server = self._start_server()
         port = server.server_address[1]
 
@@ -211,7 +211,7 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(_stats(port)["cold_misses"], 1)
         self.assertEqual(_stats(port)["probe_sends"], 2)
 
-    def test_healthz_reports_failure_live_while_tile_cache_stays_warm(self) -> None:
+    def test_health_endpoint_reports_failure_live_while_tile_cache_stays_warm(self) -> None:
         server = self._start_server()
         port = server.server_address[1]
         # Warm the ordinary tile cache first.
