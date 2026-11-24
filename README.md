@@ -100,7 +100,12 @@ Config is via environment variables, all optional:
 - Only a **complete, successful (`200`/`206`)** range read is cached.
   Errors, transient failures, and truncated reads (a declared
   `Content-Length` the delivered body didn't match) are never cached and
-  remain retryable on the next request.
+  remain retryable on the next request. Reads are also bounded (per
+  MINECRAFT-571 comment 55839's cross-lane finding on raster proxies that
+  buffered an origin's response in full): an origin that ignores `Range`
+  and returns far more than requested is never read past the expected
+  size, and the resulting oversized response is treated the same as a
+  truncated one — never cached.
 - Cache key is the exact `(tile path, byte range)` the client asked for.
 - Cached tile data is **TTL -1** (no time-based expiration) per the
   cross-lane direction (MINECRAFT-571 comment 55740): a good hit survives
@@ -195,7 +200,10 @@ access, no live provider) and exercise:
   through the proxy while an already-warmed tile keeps serving from SQLite
   unaffected, then `/__health` recovers once the upstream comes back),
 - health-endpoint-head (`HEAD /__health` answers with just this proxy's
-  own status and no body, matching the real client's probe shape).
+  own status and no body, matching the real client's probe shape),
+- bounded-oversized-read (an origin that ignores `Range` and returns far
+  more than requested is read only up to the expected size and never
+  cached).
 - ttl-minus-one (a warm tile survives both a restart and a simulated huge
   forward clock jump with zero additional upstream calls),
 - explicit-invalidation (`DELETE` on one tile path, and `DELETE

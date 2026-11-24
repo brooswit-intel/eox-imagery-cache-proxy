@@ -150,20 +150,32 @@ class Config:
         )
 
 
-def _forward(config: Config, path: str, range_header: str):
+_HEALTH_PROBE_MAX_BYTES = 1 << 16  # 64 KiB: generous for a 1-byte range read even if the
+# origin ignores Range and returns a small whole tile; still bounds memory if it doesn't.
+
+
+def _forward(config: Config, path: str, range_header: str, max_body_bytes: int = MAX_TILE_BYTES):
     """Makes one actual network send to the fixed upstream for one exact byte
-    range of one validated tile path.
+    range of one validated tile path (or the fixed health-probe path).
 
     Always returns a 3-tuple and never raises for a network/transport
     failure — every way the send can go wrong is folded into the return
     value so the caller has exactly one place to decide whether anything is
     cacheable.
 
+    Reads are capped at ``max_body_bytes + 1``: an origin that ignores the
+    Range header and returns far more than requested (or an error page
+    larger than expected) is detected and never buffered in full — status
+    and whatever was read up to the cap are still returned, but ``complete``
+    is False, so an oversized response is treated the same as a truncated
+    one and never cached as success.
+
     Returns (status, body, complete):
     - ``status`` is 0 if no response was ever received at all.
     - ``complete`` is False whenever the response must not be cached as
-      success: a non-200/206 status, or a declared length that the actually
-      delivered body didn't match (a genuine mid-transfer truncation).
+      success: a non-200/206 status, a declared length that the actually
+      delivered body didn't match (a genuine mid-transfer truncation), or a
+      body that exceeded ``max_body_bytes``.
     """
     base = urlsplit(config.upstream_base)
     url = urlunsplit((base.scheme, base.netloc, base.path + path, "", ""))
@@ -176,17 +188,21 @@ def _forward(config: Config, path: str, range_header: str):
         with urllib.request.urlopen(req, timeout=config.timeout_seconds) as resp:
             expected_length = resp.headers.get("Content-Length")
             try:
-                raw = resp.read()
+                raw = resp.read(max_body_bytes + 1)
             except (http.client.HTTPException, OSError):
                 return resp.status, b"", False
+            if len(raw) > max_body_bytes:
+                return resp.status, raw[:max_body_bytes], False
             complete = expected_length is None or len(raw) == int(expected_length)
             return resp.status, raw, complete
     except urllib.error.HTTPError as exc:
         # 404/403 land here too: a real, complete answer from the upstream,
         # just not a 2xx one. Never cached as success; the status is
         # forwarded through unmodified so the client keeps making its own
-        # missing-vs-transient distinction.
-        return exc.code, exc.read(), False
+        # missing-vs-transient distinction. Still bounded — an oversized
+        # error body is truncated to the cap rather than read in full.
+        body = exc.read(max_body_bytes + 1)
+        return exc.code, body[:max_body_bytes], False
     except (urllib.error.URLError, OSError):
         # Covers both "never connected at all" (URLError: refused/DNS/
         # timeout before any bytes) and "connected but the peer dropped us
@@ -229,7 +245,9 @@ def make_handler(cache: Cache, config: Config):
             # upstream for the probe request actually sent (a bounded Range
             # read) — 200 or 206 are both genuine successful answers to
             # that request; anything else (404/403/5xx/no response) is not.
-            status, _body, _complete = _forward(config, _HEALTH_PROBE_PATH, _HEALTH_PROBE_RANGE)
+            status, _body, _complete = _forward(
+                config, _HEALTH_PROBE_PATH, _HEALTH_PROBE_RANGE, max_body_bytes=_HEALTH_PROBE_MAX_BYTES
+            )
             cache.record_probe_send()
             if status == 0:
                 return 502, {"upstream": "unreachable"}

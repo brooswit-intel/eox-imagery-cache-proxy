@@ -22,6 +22,7 @@ class FakeUpstream:
         self.range_calls: list[tuple[str, str | None]] = []
         self.fail_next = False
         self.down = False
+        self.ignore_range = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,7 +58,7 @@ class FakeUpstream:
                     self.wfile.write(payload)
                     return
 
-                if not range_header or not range_header.startswith("bytes="):
+                if outer.ignore_range or not range_header or not range_header.startswith("bytes="):
                     self.send_response(200)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(content)))

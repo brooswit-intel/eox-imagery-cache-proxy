@@ -14,6 +14,7 @@ from fake_upstream import FakeUpstream
 
 TILE_0_0_0 = "/0/0/0.jpg"
 TILE_5_3_2 = "/5/3/2.jpg"
+TILE_RANGE_MAX_BYTES = 1 << 20  # matches server.MAX_TILE_BYTES
 TILE_RANGE = "bytes=0-1048575"
 
 
@@ -311,6 +312,28 @@ class ProxyTestCase(unittest.TestCase):
         self.upstream.down = True
         status2 = _health_head(port)
         self.assertEqual(status2, 502)
+
+    def test_range_ignoring_oversized_response_is_bounded_and_not_cached(self) -> None:
+        # An origin that ignores Range and returns far more than the
+        # requested/expected size must never be buffered in full, and must
+        # never be cached as a successful read.
+        oversized_path = "/9/1/1.jpg"
+        huge = b"x" * (TILE_RANGE_MAX_BYTES + 4096)
+        self.upstream.tiles[oversized_path] = huge
+        self.upstream.ignore_range = True
+
+        server = self._start_server()
+        port = server.server_address[1]
+        status, body = _get(port, oversized_path, TILE_RANGE)
+        self.assertEqual(status, 200)
+        # Bounded, not the full oversized body.
+        self.assertLessEqual(len(body), TILE_RANGE_MAX_BYTES)
+        # Never cached: a repeat identical request goes upstream again.
+        calls_before = self.upstream.call_count
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+        status2, _ = _get(port, oversized_path, TILE_RANGE)
+        self.assertEqual(status2, 200)
+        self.assertGreater(self.upstream.call_count, calls_before)
 
     def test_clear_all_invalidates_every_entry(self) -> None:
         server = self._start_server()
