@@ -118,13 +118,34 @@ def _validate_tile_path(path: str) -> tuple[int, int, int] | None:
     return zoom, row, col
 
 
+#: The one allowlisted upstream origin. M579 requires a *fixed* HTTPS
+#: origin — this is not a default that env config may override, it is the
+#: only value the real deployed process (``Config.from_env()``) ever uses.
+FIXED_UPSTREAM_BASE = "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g"
+
+#: Loopback-only. Same rationale as FIXED_UPSTREAM_BASE: the deployed
+#: process is never bound anywhere else.
+FIXED_BIND_HOST = "127.0.0.1"
+
+
 class Config:
+    """Holds bind/upstream/cache settings.
+
+    The constructor itself stays unrestricted so tests can construct a
+    ``Config`` pointed at a loopback fake upstream directly — that is the
+    intentional, test-only injection seam. ``from_env()`` is the real
+    production entrypoint (used by ``run()``/``main()``) and is the one
+    place that must never let host env vars widen this proxy's security
+    boundaries: it always binds loopback and always targets the one
+    allowlisted EOX origin, regardless of what is set in the environment.
+    """
+
     def __init__(
         self,
-        bind_host: str = "127.0.0.1",
+        bind_host: str = FIXED_BIND_HOST,
         bind_port: int = 8836,
         sqlite_path: str = "./eox-imagery-cache.sqlite3",
-        upstream_base: str = "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g",
+        upstream_base: str = FIXED_UPSTREAM_BASE,
         max_cache_bytes: int = 2 << 30,
         timeout_seconds: float = 30.0,
     ) -> None:
@@ -137,14 +158,19 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Deliberately NOT reading PROXY_BIND_HOST or EOX_UPSTREAM_BASE
+        # here: those would let the environment widen this proxy beyond
+        # loopback or away from the one allowlisted EOX origin, violating
+        # M579's "loopback-only proxy, fixed HTTPS allowlisted origin"
+        # requirement (found by independent review, MINECRAFT-579 comment
+        # 55987). Only knobs that can never cross that boundary — the
+        # loopback port, the local SQLite path, cache size, and timeout —
+        # are configurable for the real deployed process.
         return cls(
-            bind_host=os.environ.get("PROXY_BIND_HOST", "127.0.0.1"),
+            bind_host=FIXED_BIND_HOST,
             bind_port=int(os.environ.get("PROXY_BIND_PORT", "8836")),
             sqlite_path=os.environ.get("PROXY_SQLITE_PATH", "./eox-imagery-cache.sqlite3"),
-            upstream_base=os.environ.get(
-                "EOX_UPSTREAM_BASE",
-                "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g",
-            ),
+            upstream_base=FIXED_UPSTREAM_BASE,
             max_cache_bytes=int(os.environ.get("PROXY_MAX_CACHE_BYTES", str(2 << 30))),
             timeout_seconds=float(os.environ.get("PROXY_UPSTREAM_TIMEOUT_SECONDS", "30")),
         )

@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from eox_imagery_cache_proxy.server import Config, ProxyServer
+from eox_imagery_cache_proxy.server import Config, FIXED_BIND_HOST, FIXED_UPSTREAM_BASE, ProxyServer
 from eox_imagery_cache_proxy.cache import Cache
 
 from fake_upstream import FakeUpstream
@@ -532,6 +532,50 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["invalidated"], 2)
         self.assertEqual(_stats(port)["cached_entries"], 0)
+
+
+class ConfigFromEnvTestCase(unittest.TestCase):
+    # Independent-review finding (MINECRAFT-579 comment 55987): the
+    # deployed process's bind host and upstream origin must be a fixed
+    # loopback/fixed-HTTPS-origin boundary that env vars can never widen,
+    # even though Config() itself (the test-only direct-construction seam
+    # used everywhere above) stays fully flexible for fake-upstream
+    # injection in tests.
+
+    def setUp(self) -> None:
+        self._env_backup = dict(os.environ)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._env_backup)
+
+    def test_bind_host_env_override_is_ignored(self) -> None:
+        os.environ["PROXY_BIND_HOST"] = "0.0.0.0"
+        config = Config.from_env()
+        self.assertEqual(config.bind_host, FIXED_BIND_HOST)
+        self.assertEqual(config.bind_host, "127.0.0.1")
+
+    def test_upstream_base_env_override_is_ignored(self) -> None:
+        os.environ["EOX_UPSTREAM_BASE"] = "http://example.invalid/base"
+        config = Config.from_env()
+        self.assertEqual(config.upstream_base, FIXED_UPSTREAM_BASE)
+        self.assertTrue(config.upstream_base.startswith("https://tiles.maps.eox.at/"))
+
+    def test_benign_env_overrides_still_work(self) -> None:
+        # Only the two security-boundary vars above are ignored -- the
+        # loopback port, local SQLite path, cache size, and timeout never
+        # cross the loopback/fixed-origin boundary and remain configurable
+        # (needed e.g. for the demo's per-source port assignment, M571
+        # comment 55954).
+        os.environ["PROXY_BIND_PORT"] = "9999"
+        os.environ["PROXY_SQLITE_PATH"] = "/tmp/whatever.sqlite3"
+        os.environ["PROXY_MAX_CACHE_BYTES"] = "123456"
+        os.environ["PROXY_UPSTREAM_TIMEOUT_SECONDS"] = "5"
+        config = Config.from_env()
+        self.assertEqual(config.bind_port, 9999)
+        self.assertEqual(config.sqlite_path, "/tmp/whatever.sqlite3")
+        self.assertEqual(config.max_cache_bytes, 123456)
+        self.assertEqual(config.timeout_seconds, 5.0)
 
 
 if __name__ == "__main__":

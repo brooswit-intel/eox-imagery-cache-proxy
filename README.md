@@ -84,12 +84,21 @@ Config is via environment variables, all optional:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `PROXY_BIND_HOST` | `127.0.0.1` | Bind address. Loopback-only by default. |
 | `PROXY_BIND_PORT` | `8836` | Listen port. |
 | `PROXY_SQLITE_PATH` | `./eox-imagery-cache.sqlite3` | Cache database file. A missing file starts empty. |
-| `EOX_UPSTREAM_BASE` | `https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g` | Fixed, allowlisted HTTPS upstream origin. Point this at a fake/local upstream for any testing. |
 | `PROXY_MAX_CACHE_BYTES` | `2147483648` (2 GiB) | Bound on total cached bytes; oldest-touched entries are evicted first once exceeded. |
 | `PROXY_UPSTREAM_TIMEOUT_SECONDS` | `30` | Per-request timeout talking to the upstream. |
+
+The bind address (always `127.0.0.1`) and the upstream origin (always the
+fixed EOX WMTS origin below) are **not** environment-configurable for the
+deployed process — `Config.from_env()` ignores any `PROXY_BIND_HOST` or
+`EOX_UPSTREAM_BASE` set in its environment and always uses the fixed
+values, by design: this proxy's "loopback-only, fixed HTTPS allowlisted
+origin" requirement must not be something the environment can widen away
+(independent-review finding, MINECRAFT-579 comment 55987). Only `Config`
+itself — the test-only direct-construction path used by this repo's own
+tests to inject a loopback fake upstream — stays unrestricted; nothing
+reachable from a deployed process's environment can reach it.
 
 ## Caching rules
 
@@ -189,9 +198,9 @@ server.
 
 ## Security notes
 
-- Binds to loopback by default. There is no authentication in front of
-  this proxy — anything that can reach `PROXY_BIND_HOST:PROXY_BIND_PORT`
-  can use it. Don't bind it to a non-loopback address without adding that.
+- Always binds loopback (`127.0.0.1:PROXY_BIND_PORT`) — not configurable
+  away, see above. There is no authentication in front of this proxy —
+  anything on the same host that can reach that port can use it.
 - No credentials are involved at all (EOX's public WMTS endpoint needs
   none), so there is nothing upstream-secret for this proxy to leak.
 
