@@ -22,6 +22,7 @@ from dataclasses import dataclass
 class CachedRange:
     status: int
     body: bytes
+    content_range: str | None = None
 
 
 class Cache:
@@ -47,6 +48,9 @@ class Cache:
             " last_access REAL NOT NULL"
             ")"
         )
+        existing_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(entries)")}
+        if "content_range" not in existing_columns:
+            self._conn.execute("ALTER TABLE entries ADD COLUMN content_range TEXT")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS counters ("
             " name TEXT PRIMARY KEY,"
@@ -67,7 +71,7 @@ class Cache:
     def get(self, key: str) -> CachedRange | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT status, body FROM entries WHERE key = ?", (key,)
+                "SELECT status, body, content_range FROM entries WHERE key = ?", (key,)
             ).fetchone()
             if row is not None:
                 self._conn.execute(
@@ -77,8 +81,8 @@ class Cache:
                 self._conn.commit()
         if row is None:
             return None
-        status, body = row
-        return CachedRange(status=status, body=bytes(body))
+        status, body, content_range = row
+        return CachedRange(status=status, body=bytes(body), content_range=content_range)
 
     def put(self, key: str, response: CachedRange) -> None:
         """Store a complete, successful (200/206) range read. Callers must
@@ -88,9 +92,9 @@ class Cache:
         size = len(response.body)
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO entries (key, status, body, size, last_access)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (key, response.status, response.body, size, time.time()),
+                "INSERT OR REPLACE INTO entries (key, status, body, size, last_access, content_range)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (key, response.status, response.body, size, time.time(), response.content_range),
             )
             self._evict_locked()
             self._conn.commit()

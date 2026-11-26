@@ -170,12 +170,21 @@ def _forward(config: Config, path: str, range_header: str, max_body_bytes: int =
     is False, so an oversized response is treated the same as a truncated
     one and never cached as success.
 
-    Returns (status, body, complete):
+    Returns (status, body, complete, content_range):
     - ``status`` is 0 if no response was ever received at all.
     - ``complete`` is False whenever the response must not be cached as
       success: a non-200/206 status, a declared length that the actually
-      delivered body didn't match (a genuine mid-transfer truncation), or a
-      body that exceeded ``max_body_bytes``.
+      delivered body didn't match (a genuine mid-transfer truncation), a
+      body that exceeded ``max_body_bytes``, or (see below) a 206 with no
+      ``Content-Range`` header at all.
+    - ``content_range`` is the upstream's own ``Content-Range`` header value
+      on a 206 response, or ``None`` for a 200 (whole-file reads carry no
+      such header and need none). A 206 response is only ever treated as a
+      genuine, cacheable partial read when this header is actually present
+      — a 206 missing it is malformed per RFC 7233 and is never trusted
+      enough to synthesize a value for or to forward to the real client as
+      though it were well-formed; it is downgraded to a 502 here instead so
+      callers never see a bare, spec-violating 206.
     """
     base = urlsplit(config.upstream_base)
     url = urlunsplit((base.scheme, base.netloc, base.path + path, "", ""))
@@ -187,14 +196,17 @@ def _forward(config: Config, path: str, range_header: str, max_body_bytes: int =
     try:
         with urllib.request.urlopen(req, timeout=config.timeout_seconds) as resp:
             expected_length = resp.headers.get("Content-Length")
+            content_range = resp.headers.get("Content-Range")
             try:
                 raw = resp.read(max_body_bytes + 1)
             except (http.client.HTTPException, OSError):
-                return resp.status, b"", False
+                return resp.status, b"", False, None
             if len(raw) > max_body_bytes:
-                return resp.status, raw[:max_body_bytes], False
+                return resp.status, raw[:max_body_bytes], False, None
+            if resp.status == 206 and content_range is None:
+                return 502, b"upstream sent 206 without Content-Range", False, None
             complete = expected_length is None or len(raw) == int(expected_length)
-            return resp.status, raw, complete
+            return resp.status, raw, complete, content_range if resp.status == 206 else None
     except urllib.error.HTTPError as exc:
         # 404/403 land here too: a real, complete answer from the upstream,
         # just not a 2xx one. Never cached as success; the status is
@@ -202,13 +214,13 @@ def _forward(config: Config, path: str, range_header: str, max_body_bytes: int =
         # missing-vs-transient distinction. Still bounded — an oversized
         # error body is truncated to the cap rather than read in full.
         body = exc.read(max_body_bytes + 1)
-        return exc.code, body[:max_body_bytes], False
+        return exc.code, body[:max_body_bytes], False, None
     except (urllib.error.URLError, OSError):
         # Covers both "never connected at all" (URLError: refused/DNS/
         # timeout before any bytes) and "connected but the peer dropped us
         # before a status line arrived" (e.g. http.client.RemoteDisconnected,
         # an OSError subclass) — neither is a real HTTP response.
-        return 0, b"", False
+        return 0, b"", False, None
 
 
 def make_handler(cache: Cache, config: Config):
@@ -229,12 +241,12 @@ def make_handler(cache: Cache, config: Config):
             with lock:
                 cached = cache.get(key)
                 if cached is not None:
-                    return "warm", cached.status, cached.body
-                status, body, complete = _forward(config, path, range_header)
+                    return "warm", cached.status, cached.body, cached.content_range
+                status, body, complete, content_range = _forward(config, path, range_header)
                 if status in (200, 206) and complete:
-                    cache.put(key, CachedRange(status=status, body=body))
-                    return "cold", status, body
-                return "uncached", status, body
+                    cache.put(key, CachedRange(status=status, body=body, content_range=content_range))
+                    return "cold", status, body, content_range
+                return "uncached", status, body, content_range
         finally:
             with locks_guard:
                 entry[1] -= 1
@@ -254,7 +266,7 @@ def make_handler(cache: Cache, config: Config):
             # upstream for the probe request actually sent (a bounded Range
             # read) — 200 or 206 are both genuine successful answers to
             # that request; anything else (404/403/5xx/no response) is not.
-            status, _body, _complete = _forward(
+            status, _body, _complete, _content_range = _forward(
                 config, _HEALTH_PROBE_PATH, _HEALTH_PROBE_RANGE, max_body_bytes=_HEALTH_PROBE_MAX_BYTES
             )
             cache.record_probe_send()
@@ -301,22 +313,26 @@ def make_handler(cache: Cache, config: Config):
                 return
 
             key = Cache.key(parsed.path, start, end)
-            outcome, status, body = singleflight_fetch(key, parsed.path, range_header)
+            outcome, status, body, content_range = singleflight_fetch(key, parsed.path, range_header)
             if outcome == "warm":
                 cache.record_warm_hit()
-                self._respond_bytes(status, body)
+                self._respond_bytes(status, body, content_range)
                 return
             if outcome == "cold":
                 cache.record_cold_miss()
-                self._respond_bytes(status, body)
+                self._respond_bytes(status, body, content_range)
                 return
-            # uncached: error, transient failure, or truncated — never
-            # stored, always retryable on the next request.
+            # uncached: error, transient failure, truncated, or a malformed
+            # 206 missing Content-Range (downgraded to 502 by _forward) —
+            # never stored, always retryable on the next request.
             cache.record_cold_miss()
             if status == 0:
                 self._respond_plain(502, b"upstream unreachable")
                 return
-            self._respond_bytes(status, body)
+            if status == 502:
+                self._respond_plain(502, body if body else b"upstream response was not usable")
+                return
+            self._respond_bytes(status, body, content_range)
 
         def do_DELETE(self) -> None:
             parsed = urlsplit(self.path)
@@ -330,10 +346,17 @@ def make_handler(cache: Cache, config: Config):
             removed = cache.delete_prefix(parsed.path)
             self._respond_json(200, {"invalidated": removed})
 
-        def _respond_bytes(self, status: int, body: bytes) -> None:
+        def _respond_bytes(self, status: int, body: bytes, content_range: str | None = None) -> None:
             self.send_response(status)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(body)))
+            if status == 206:
+                # A 206 is only ever reached here with a real, upstream-
+                # supplied Content-Range — _forward() downgrades a 206
+                # missing one to a 502 before it ever gets this far, so
+                # there is nothing to guess or synthesize here.
+                assert content_range is not None
+                self.send_header("Content-Range", content_range)
             self.end_headers()
             self.wfile.write(body)
 

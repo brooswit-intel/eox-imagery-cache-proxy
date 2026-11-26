@@ -106,6 +106,14 @@ Config is via environment variables, all optional:
   and returns far more than requested is never read past the expected
   size, and the resulting oversized response is treated the same as a
   truncated one — never cached.
+- A `206` response's `Content-Range` header is captured from the upstream
+  and forwarded verbatim on both a cold (upstream) and warm (cached) read —
+  never dropped and never synthesized. A `206` with no `Content-Range` at
+  all is malformed per RFC 7233; this proxy downgrades it to a `502` rather
+  than forwarding a bare, spec-violating partial response, and never caches
+  it (found via live Zippy-demo traffic, MINECRAFT-579 comment 55976; see
+  `test_malformed_206_missing_content_range_is_rejected_and_not_cached`). A
+  whole-file `200` carries no `Content-Range` by design and needs none.
 - Cache key is the exact `(tile path, byte range)` the client asked for.
 - Cached tile data is **TTL -1** (no time-based expiration) per the
   cross-lane direction (MINECRAFT-571 comment 55740): a good hit survives
@@ -213,3 +221,11 @@ access, no live provider) and exercise:
 - explicit-invalidation (`DELETE` on one tile path, and `DELETE
   /_internal/cache` for everything, each force the next read to go
   upstream again).
+- content-range-forwarded (a `206`'s real `Content-Range` is present and
+  correct on both the cold and the warm response),
+- malformed-206-rejected (a `206` missing `Content-Range` is downgraded to
+  `502` and never cached — the exact shape of the live Zippy-demo bug in
+  MINECRAFT-579 comment 55976),
+- whole-file-200-needs-no-content-range (a legitimate short whole-file
+  `200` JPEG is served and cached correctly with no `Content-Range` at
+  all).

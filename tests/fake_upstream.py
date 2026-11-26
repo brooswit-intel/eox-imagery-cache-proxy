@@ -23,6 +23,7 @@ class FakeUpstream:
         self.fail_next = False
         self.down = False
         self.ignore_range = False
+        self.omit_content_range = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -69,10 +70,14 @@ class FakeUpstream:
                 start_s, _, end_s = range_header[len("bytes="):].partition("-")
                 start, end = int(start_s), int(end_s)
                 body = content[start:end + 1]
+                # A real server clamps the advertised end to what it
+                # actually had available, not the requested end.
+                actual_end = start + len(body) - 1
                 self.send_response(206)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Content-Range", f"bytes {start}-{end}/{len(content)}")
+                if not outer.omit_content_range:
+                    self.send_header("Content-Range", f"bytes {start}-{actual_end}/{len(content)}")
                 self.end_headers()
                 self.wfile.write(body)
 

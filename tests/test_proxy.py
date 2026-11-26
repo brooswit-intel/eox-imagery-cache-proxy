@@ -57,6 +57,17 @@ def _health(port: int) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read())
 
 
+def _get_with_headers(port: int, path: str, range_header: str | None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET")
+    if range_header is not None:
+        req.add_header("Range", range_header)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers)
+
+
 def _health_head(port: int) -> int:
     req = urllib.request.Request(f"http://127.0.0.1:{port}/__health", method="HEAD")
     try:
@@ -104,20 +115,73 @@ class ProxyTestCase(unittest.TestCase):
     def test_cold_then_warm(self) -> None:
         server = self._start_server()
         port = server.server_address[1]
-        status, body = _get(port, TILE_5_3_2, TILE_RANGE)
+        status, body, headers = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
         self.assertEqual(status, 206)
         self.assertEqual(body, self.tile_bytes)
+        # A 206 must carry a real Content-Range, matching the exact range
+        # requested — bug found live via the Zippy demo (MINECRAFT-579
+        # comment 55976): a 206 with no/mismatched Content-Range is
+        # malformed per RFC 7233 and the real client (RangeFiles) rejects
+        # it as corrupt rather than accepting a bare partial body.
+        self.assertEqual(headers.get("Content-Range"), f"bytes 0-1023/{len(self.tile_bytes)}")
         self.assertEqual(self.upstream.call_count, 1)
 
-        status2, body2 = _get(port, TILE_5_3_2, TILE_RANGE)
+        status2, body2, headers2 = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
         self.assertEqual(status2, 206)
         self.assertEqual(body2, self.tile_bytes)
+        self.assertEqual(headers2.get("Content-Range"), f"bytes 0-1023/{len(self.tile_bytes)}")
         # Served from the SQLite cache: no second upstream send.
         self.assertEqual(self.upstream.call_count, 1)
 
         stats = _stats(port)
         self.assertEqual(stats["cold_misses"], 1)
         self.assertEqual(stats["warm_hits"], 1)
+
+    def test_malformed_206_missing_content_range_is_rejected_and_not_cached(self) -> None:
+        # Reproduces the live Zippy-demo bug (MINECRAFT-579 comment 55976):
+        # an upstream 206 with no Content-Range header at all must never be
+        # forwarded to the client as a bare 206 (that is itself malformed
+        # per RFC 7233, and the real client rejects it), and must never be
+        # cached as a successful read — it is retryable, same as any other
+        # incomplete response.
+        self.upstream.omit_content_range = True
+        server = self._start_server()
+        port = server.server_address[1]
+        status, body = _get(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status, 502)
+        self.assertEqual(self.upstream.call_count, 1)
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
+        # Not cached: a repeat request goes upstream again, not served
+        # (warm) as a bogus success.
+        self.upstream.omit_content_range = False
+        status2, body2, headers2 = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.tile_bytes)
+        self.assertIsNotNone(headers2.get("Content-Range"))
+        self.assertEqual(self.upstream.call_count, 2)
+        self.assertEqual(_stats(port)["warm_hits"], 0)
+
+    def test_legitimate_short_whole_file_200_jpeg_needs_no_content_range(self) -> None:
+        # A complete, valid whole-file 200 response (the upstream ignoring
+        # Range, or a client-side plain GET) carries no Content-Range at
+        # all by design -- 200 means "here is the whole thing," not a
+        # partial -- and must still be served and cached correctly.
+        self.upstream.ignore_range = True
+        server = self._start_server()
+        port = server.server_address[1]
+        status, body, headers = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.tile_bytes)
+        self.assertIsNone(headers.get("Content-Range"))
+        self.assertEqual(_stats(port)["cached_entries"], 1)
+
+        calls_before = self.upstream.call_count
+        status2, body2, headers2 = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, self.tile_bytes)
+        self.assertIsNone(headers2.get("Content-Range"))
+        self.assertEqual(self.upstream.call_count, calls_before)
 
     def test_restart_keeps_warm_cache(self) -> None:
         server = self._start_server()
