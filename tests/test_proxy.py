@@ -399,6 +399,70 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(status2, 200)
         self.assertGreater(self.upstream.call_count, calls_before)
 
+    def test_legacy_pre_migration_headerless_206_row_is_invalidated_not_replayed(self) -> None:
+        # Reproduces John's follow-up on the live fix (MINECRAFT-579 comment
+        # 55979): a Zippy SQLite predating the content_range column has
+        # existing 206 rows with no header at all. The migration adds the
+        # column as nullable, so Cache.get() must treat that legacy shape
+        # as invalid and transparently re-fetch -- never hand a status-206,
+        # content_range=None CachedRange to the response writer (which
+        # asserts a real header is present on any 206 it serves).
+        import sqlite3
+
+        # Build the pre-migration schema by hand: exactly what main looked
+        # like before this column existed, with one legacy headerless 206
+        # row (the exact bug shape) and one ordinary legacy 200 row (never
+        # needed a Content-Range, must survive untouched).
+        legacy_db = sqlite3.connect(self.sqlite_path)
+        legacy_db.execute(
+            "CREATE TABLE entries ("
+            " key TEXT PRIMARY KEY, status INTEGER NOT NULL, body BLOB NOT NULL,"
+            " size INTEGER NOT NULL, last_access REAL NOT NULL)"
+        )
+        legacy_db.execute(
+            "CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+        )
+        for name in Cache.COUNTER_NAMES:
+            legacy_db.execute("INSERT INTO counters (name, value) VALUES (?, 0)", (name,))
+        legacy_key = Cache.key(TILE_5_3_2, 0, 1048575)
+        legacy_db.execute(
+            "INSERT INTO entries (key, status, body, size, last_access) VALUES (?, ?, ?, ?, ?)",
+            (legacy_key, 206, self.tile_bytes, len(self.tile_bytes), 1.0),
+        )
+        legit_200_key = Cache.key(TILE_0_0_0, 0, 1048575)
+        legacy_db.execute(
+            "INSERT INTO entries (key, status, body, size, last_access) VALUES (?, ?, ?, ?, ?)",
+            (legit_200_key, 200, self.tile_bytes, len(self.tile_bytes), 1.0),
+        )
+        legacy_db.commit()
+        legacy_db.close()
+
+        server = self._start_server()  # opens the legacy file; migrates the column
+        port = server.server_address[1]
+
+        # The legacy headerless 206 must not be replayed (no 500, no bare
+        # 206) -- it is invalidated and re-fetched exactly like a genuine
+        # cold miss, landing a correct, fully-headered 206 this time.
+        status, body, headers = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.tile_bytes)
+        self.assertIsNotNone(headers.get("Content-Range"))
+        self.assertEqual(self.upstream.call_count, 1)
+
+        # A repeat is now warm from the freshly-written, correct entry.
+        status2, body2, headers2 = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status2, 206)
+        self.assertIsNotNone(headers2.get("Content-Range"))
+        self.assertEqual(self.upstream.call_count, 1)
+
+        # The untouched legacy 200 entry is still served warm, with zero
+        # upstream calls for it -- the migration/invalidation logic only
+        # ever touches the specific malformed-206 shape, nothing else.
+        status3, body3 = _get(port, TILE_0_0_0, TILE_RANGE)
+        self.assertEqual(status3, 200)
+        self.assertEqual(body3, self.tile_bytes)
+        self.assertEqual(self.upstream.call_count, 1)
+
     def test_clear_all_invalidates_every_entry(self) -> None:
         server = self._start_server()
         port = server.server_address[1]

@@ -229,3 +229,9 @@ access, no live provider) and exercise:
 - whole-file-200-needs-no-content-range (a legitimate short whole-file
   `200` JPEG is served and cached correctly with no `Content-Range` at
   all).
+- legacy-headerless-206-row-invalidated (a SQLite file populated before
+  the `content_range` column existed has 206 rows with the column backfilled
+  as `NULL`; such a row is never replayed as a bare 206 — it is invalidated
+  and transparently re-fetched on next access, same as a genuine cold miss,
+  while an untouched legacy `200` row in the same file is served warm
+  unaffected; per John's follow-up in MINECRAFT-579 comment 55979).

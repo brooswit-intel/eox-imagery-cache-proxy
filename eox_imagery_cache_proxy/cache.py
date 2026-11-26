@@ -73,15 +73,26 @@ class Cache:
             row = self._conn.execute(
                 "SELECT status, body, content_range FROM entries WHERE key = ?", (key,)
             ).fetchone()
-            if row is not None:
-                self._conn.execute(
-                    "UPDATE entries SET last_access = ? WHERE key = ?",
-                    (time.time(), key),
-                )
+            if row is None:
+                return None
+            status, body, content_range = row
+            if status == 206 and content_range is None:
+                # A row written before the content_range column existed
+                # (or, in principle, by any future bug that again lets a
+                # headerless 206 slip through to put()): this cached entry
+                # is itself exactly the malformed-206 shape the proxy must
+                # never serve. Never replay it — invalidate it here and
+                # report a miss so the caller re-fetches it properly from
+                # upstream, the same path a genuine cold miss takes. No
+                # byte range is guessed; the stale row is simply discarded.
+                self._conn.execute("DELETE FROM entries WHERE key = ?", (key,))
                 self._conn.commit()
-        if row is None:
-            return None
-        status, body, content_range = row
+                return None
+            self._conn.execute(
+                "UPDATE entries SET last_access = ? WHERE key = ?",
+                (time.time(), key),
+            )
+            self._conn.commit()
         return CachedRange(status=status, body=bytes(body), content_range=content_range)
 
     def put(self, key: str, response: CachedRange) -> None:
