@@ -24,6 +24,7 @@ class FakeUpstream:
         self.down = False
         self.ignore_range = False
         self.omit_content_range = False
+        self.mismatched_content_range = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -77,7 +78,13 @@ class FakeUpstream:
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(body)))
                 if not outer.omit_content_range:
-                    self.send_header("Content-Range", f"bytes {start}-{actual_end}/{len(content)}")
+                    if outer.mismatched_content_range:
+                        # A real-world malformed answer: present and
+                        # syntactically valid, but describing a different
+                        # range than the body actually delivered.
+                        self.send_header("Content-Range", f"bytes 1-{actual_end}/{len(content)}")
+                    else:
+                        self.send_header("Content-Range", f"bytes {start}-{actual_end}/{len(content)}")
                 self.end_headers()
                 self.wfile.write(body)
 

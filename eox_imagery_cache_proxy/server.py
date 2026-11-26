@@ -64,7 +64,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, urlunsplit
 
-from .cache import Cache, CachedRange
+from .cache import Cache, CachedRange, content_range_matches_body
 
 MAX_ZOOM = 14
 MAX_TILE_BYTES = 1 << 20
@@ -180,11 +180,14 @@ def _forward(config: Config, path: str, range_header: str, max_body_bytes: int =
     - ``content_range`` is the upstream's own ``Content-Range`` header value
       on a 206 response, or ``None`` for a 200 (whole-file reads carry no
       such header and need none). A 206 response is only ever treated as a
-      genuine, cacheable partial read when this header is actually present
-      — a 206 missing it is malformed per RFC 7233 and is never trusted
-      enough to synthesize a value for or to forward to the real client as
-      though it were well-formed; it is downgraded to a 502 here instead so
-      callers never see a bare, spec-violating 206.
+      genuine, cacheable partial read when this header is both present AND
+      validated (via ``_content_range_matches_body``) to actually describe
+      the delivered body — a 206 that is missing it, unparseable, or whose
+      advertised range doesn't match the real bytes received is malformed
+      per RFC 7233 and is never trusted enough to synthesize a value for or
+      to forward to the real client as though it were well-formed; it is
+      downgraded to a 502 here instead so callers never see a bare or
+      mismatched 206.
     """
     base = urlsplit(config.upstream_base)
     url = urlunsplit((base.scheme, base.netloc, base.path + path, "", ""))
@@ -203,8 +206,8 @@ def _forward(config: Config, path: str, range_header: str, max_body_bytes: int =
                 return resp.status, b"", False, None
             if len(raw) > max_body_bytes:
                 return resp.status, raw[:max_body_bytes], False, None
-            if resp.status == 206 and content_range is None:
-                return 502, b"upstream sent 206 without Content-Range", False, None
+            if resp.status == 206 and not content_range_matches_body(content_range, len(raw)):
+                return 502, b"upstream sent a 206 with a missing or mismatched Content-Range", False, None
             complete = expected_length is None or len(raw) == int(expected_length)
             return resp.status, raw, complete, content_range if resp.status == 206 else None
     except urllib.error.HTTPError as exc:

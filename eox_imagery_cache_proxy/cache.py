@@ -12,10 +12,43 @@ a long-running proxy can't grow its SQLite file without limit.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+
+_CONTENT_RANGE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+
+
+def content_range_matches_body(content_range: str | None, body_len: int) -> bool:
+    """Validates that a 206's ``Content-Range`` is both syntactically
+    well-formed (RFC 7233 ``bytes <start>-<end>/<total>``) and actually
+    describes the body bytes received or stored — not merely present.
+
+    The real client only ever sends ``Range: bytes=0-1048575`` (offset
+    zero), so a genuine, trustworthy answer must start at 0 and its
+    advertised length (``end - start + 1``) must equal the body length
+    exactly; anything else — missing entirely, a mismatched offset, a
+    declared length that doesn't match the actual bytes, an unparseable
+    header — is malformed and must never be served or replayed as though
+    it were a real partial response. Nothing here guesses or synthesizes a
+    byte range; it only validates one that's already present.
+    """
+    if content_range is None:
+        return False
+    match = _CONTENT_RANGE.match(content_range)
+    if match is None:
+        return False
+    start, end, total = match.groups()
+    start, end = int(start), int(end)
+    if start != 0 or end < start:
+        return False
+    if end - start + 1 != body_len:
+        return False
+    if total != "*" and int(total) < body_len:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -76,11 +109,13 @@ class Cache:
             if row is None:
                 return None
             status, body, content_range = row
-            if status == 206 and content_range is None:
-                # A row written before the content_range column existed
-                # (or, in principle, by any future bug that again lets a
-                # headerless 206 slip through to put()): this cached entry
-                # is itself exactly the malformed-206 shape the proxy must
+            if status == 206 and not content_range_matches_body(content_range, len(body)):
+                # Either a row written before the content_range column
+                # existed (backfilled NULL), or — in principle, from any
+                # bug that let a present-but-mismatched header slip past a
+                # write-time check — a cached entry whose Content-Range
+                # doesn't actually describe its own stored body. Either way
+                # this is exactly the malformed-206 shape the proxy must
                 # never serve. Never replay it — invalidate it here and
                 # report a miss so the caller re-fetches it properly from
                 # upstream, the same path a genuine cold miss takes. No

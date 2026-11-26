@@ -106,13 +106,25 @@ Config is via environment variables, all optional:
   and returns far more than requested is never read past the expected
   size, and the resulting oversized response is treated the same as a
   truncated one — never cached.
-- A `206` response's `Content-Range` header is captured from the upstream
-  and forwarded verbatim on both a cold (upstream) and warm (cached) read —
-  never dropped and never synthesized. A `206` with no `Content-Range` at
-  all is malformed per RFC 7233; this proxy downgrades it to a `502` rather
-  than forwarding a bare, spec-violating partial response, and never caches
-  it (found via live Zippy-demo traffic, MINECRAFT-579 comment 55976; see
-  `test_malformed_206_missing_content_range_is_rejected_and_not_cached`). A
+- A `206` response's `Content-Range` header is captured from the upstream,
+  validated (`content_range_matches_body`), and forwarded verbatim on both
+  a cold (upstream) and warm (cached) read — never dropped and never
+  synthesized. A `206` is only ever trusted when `Content-Range` is both
+  present and actually describes the delivered body (`bytes 0-<len-1>/...`,
+  matching this client's only-ever-offset-zero requests exactly) — missing
+  entirely, unparseable, or present-but-mismatched (e.g. `bytes
+  1-1024/2000` for a body that doesn't start at byte 0) are all malformed
+  per RFC 7233 and treated identically: downgraded to a `502` rather than
+  ever forwarding or caching a bare or wrong partial response (found via
+  live Zippy-demo traffic and a follow-on self-review, MINECRAFT-579
+  comments 55976/55984; see `test_malformed_206_missing_content_range_is_rejected_and_not_cached`
+  and `test_mismatched_content_range_is_rejected_and_not_cached`). The same
+  validation also applies on cache *read* — a cached row whose
+  `content_range` is missing or mismatched (a legacy pre-migration row, or
+  any other way a bad row could have ended up on disk) is invalidated and
+  transparently re-fetched rather than ever replayed
+  (`test_legacy_pre_migration_headerless_206_row_is_invalidated_not_replayed`,
+  `test_legacy_row_with_mismatched_content_range_is_also_invalidated`). A
   whole-file `200` carries no `Content-Range` by design and needs none.
 - Cache key is the exact `(tile path, byte range)` the client asked for.
 - Cached tile data is **TTL -1** (no time-based expiration) per the
@@ -226,6 +238,10 @@ access, no live provider) and exercise:
 - malformed-206-rejected (a `206` missing `Content-Range` is downgraded to
   `502` and never cached — the exact shape of the live Zippy-demo bug in
   MINECRAFT-579 comment 55976),
+- mismatched-206-rejected (a `206` with a present but incorrect
+  `Content-Range` — syntactically valid, wrong range — is downgraded to
+  `502` and never cached, same as a missing header; MINECRAFT-579 comment
+  55984),
 - whole-file-200-needs-no-content-range (a legitimate short whole-file
   `200` JPEG is served and cached correctly with no `Content-Range` at
   all).

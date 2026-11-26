@@ -162,6 +162,64 @@ class ProxyTestCase(unittest.TestCase):
         self.assertEqual(self.upstream.call_count, 2)
         self.assertEqual(_stats(port)["warm_hits"], 0)
 
+    def test_mismatched_content_range_is_rejected_and_not_cached(self) -> None:
+        # Self-review finding (MINECRAFT-579 comment 55984): a 206 can carry
+        # a syntactically valid, present Content-Range that still describes
+        # the wrong range (e.g. "bytes 1-1024/1025" for a request of
+        # bytes=0-1048575 and a delivered body that doesn't start at byte
+        # 0) -- present is not the same as correct. This must be rejected
+        # exactly like a header that's missing outright.
+        self.upstream.mismatched_content_range = True
+        server = self._start_server()
+        port = server.server_address[1]
+        status, _ = _get(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status, 502)
+        self.assertEqual(self.upstream.call_count, 1)
+        self.assertEqual(_stats(port)["cached_entries"], 0)
+
+        self.upstream.mismatched_content_range = False
+        status2, body2, headers2 = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, self.tile_bytes)
+        self.assertEqual(headers2.get("Content-Range"), f"bytes 0-1023/{len(self.tile_bytes)}")
+        self.assertEqual(self.upstream.call_count, 2)
+        self.assertEqual(_stats(port)["warm_hits"], 0)
+
+    def test_legacy_row_with_mismatched_content_range_is_also_invalidated(self) -> None:
+        # Same self-review finding, applied to a row that somehow already
+        # made it into the cache with a present-but-wrong header (e.g. from
+        # a future regression, or a hand-edited/corrupted file) -- the read
+        # path must catch this too, not just the write path.
+        import sqlite3
+
+        legacy_db = sqlite3.connect(self.sqlite_path)
+        legacy_db.execute(
+            "CREATE TABLE entries ("
+            " key TEXT PRIMARY KEY, status INTEGER NOT NULL, body BLOB NOT NULL,"
+            " size INTEGER NOT NULL, last_access REAL NOT NULL, content_range TEXT)"
+        )
+        legacy_db.execute(
+            "CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+        )
+        for name in Cache.COUNTER_NAMES:
+            legacy_db.execute("INSERT INTO counters (name, value) VALUES (?, 0)", (name,))
+        bad_key = Cache.key(TILE_5_3_2, 0, 1048575)
+        legacy_db.execute(
+            "INSERT INTO entries (key, status, body, size, last_access, content_range)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (bad_key, 206, self.tile_bytes, len(self.tile_bytes), 1.0, "bytes 1-1024/2000"),
+        )
+        legacy_db.commit()
+        legacy_db.close()
+
+        server = self._start_server()
+        port = server.server_address[1]
+        status, body, headers = _get_with_headers(port, TILE_5_3_2, TILE_RANGE)
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.tile_bytes)
+        self.assertEqual(headers.get("Content-Range"), f"bytes 0-1023/{len(self.tile_bytes)}")
+        self.assertEqual(self.upstream.call_count, 1)
+
     def test_legitimate_short_whole_file_200_jpeg_needs_no_content_range(self) -> None:
         # A complete, valid whole-file 200 response (the upstream ignoring
         # Range, or a client-side plain GET) carries no Content-Range at
